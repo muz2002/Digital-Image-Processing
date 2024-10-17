@@ -23,10 +23,21 @@ def parse_image(contents):
     return None
 
 # Log transformation
-def log_transformation(image):
-    c = 255 / np.log(1 + np.max(image))
-    log_image = c * np.log(1 + image)
-    return np.array(log_image, dtype=np.uint8)
+def log_transformation(image, factor=1):
+    # Check if the image is grayscale or color
+    if len(image.shape) == 2:
+        # Grayscale image
+        c = 255 / (np.log(1 + np.max(image)))
+        log_image = c * (np.log(1 + image) ** factor)
+        return np.array(log_image, dtype=np.uint8)
+    else:
+        # Color image
+        log_image = np.zeros_like(image, dtype=np.float64)
+        for i in range(3):  # process each channel
+            channel = image[:,:,i]
+            c = 255 / (np.log(1 + np.max(channel)))
+            log_image[:,:,i] = c * (np.log(1 + channel) ** factor)
+        return np.array(log_image, dtype=np.uint8)
 
 # Power Law (Gamma) transformation
 def gamma_transformation(image, gamma=1.0):
@@ -34,24 +45,28 @@ def gamma_transformation(image, gamma=1.0):
     return gamma_corrected
 
 # Contrast stretching
-def contrast_stretching(image):
-    p2, p98 = np.percentile(image, (2, 98))
-    img_rescale = exposure.rescale_intensity(image, in_range=(p2, p98))
-    return img_rescale
+def contrast_stretching(image, percentile_range):
+    p_low, p_high = percentile_range
+    p_low, p_high = np.clip(p_low, 0, 100), np.clip(p_high, 0, 100)
+    if len(image.shape) == 2:  # Grayscale
+        p2, p98 = np.percentile(image, (p_low, p_high))
+        return exposure.rescale_intensity(image, in_range=(p2, p98))
+    else:  # Color
+        img_rescaled = np.zeros_like(image)
+        for i in range(3):
+            p2, p98 = np.percentile(image[:,:,i], (p_low, p_high))
+            img_rescaled[:,:,i] = exposure.rescale_intensity(image[:,:,i], in_range=(p2, p98))
+        return img_rescaled
 
 # Histogram equalization
-def histogram_equalization(image):
-    gray_img = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    img_eq = cv2.equalizeHist(gray_img)
-    img_eq_rgb = cv2.cvtColor(img_eq, cv2.COLOR_GRAY2RGB)
-    return img_eq_rgb
-
-# Histogram matching (using a reference image)
-def histogram_matching(image, reference):
-    matched = np.zeros_like(image)
-    for c in range(image.shape[2]):
-        matched[..., c] = exposure.match_histograms(image[..., c], reference[..., c])
-    return matched
+def histogram_equalization(image, clip_limit):
+    if len(image.shape) == 2:  # Grayscale
+        return exposure.equalize_adapthist(image, clip_limit=clip_limit)
+    else:  # Color
+        img_eq = np.zeros_like(image, dtype=np.float64)
+        for i in range(3):
+            img_eq[:,:,i] = exposure.equalize_adapthist(image[:,:,i], clip_limit=clip_limit)
+        return (img_eq * 255).astype(np.uint8)
 
 # Image Quantization
 def image_quantization(image, n_colors=8):
@@ -76,6 +91,21 @@ def compute_histogram(image):
         hist_blue = np.histogram(image[..., 2], bins=256, range=(0, 256))[0]
         return hist_red, hist_green, hist_blue
 
+# New function for image padding
+def image_padding(image, pad_width, pad_color=[255, 0, 0]):  # Default to red padding
+    # Ensure pad_color is in BGR format for OpenCV
+    pad_color_bgr = pad_color[::-1]
+    
+    return cv2.copyMakeBorder(
+        image,
+        top=pad_width,
+        bottom=pad_width,
+        left=pad_width,
+        right=pad_width,
+        borderType=cv2.BORDER_CONSTANT,
+        value=pad_color_bgr
+    )
+
 # Layout of the app
 app.layout = dbc.Container([
     dbc.Row([
@@ -99,7 +129,8 @@ app.layout = dbc.Container([
                              {'label': 'Contrast Stretching', 'value': 'contrast'},
                              {'label': 'Histogram Equalization', 'value': 'hist_eq'},
                              {'label': 'Histogram Matching', 'value': 'hist_match'},
-                             {'label': 'Image Quantization', 'value': 'quantization'}
+                             {'label': 'Image Quantization', 'value': 'quantization'},
+                             {'label': 'Image Padding', 'value': 'padding'}
                          ],
                          value='log',
                          clearable=False,
@@ -117,7 +148,7 @@ app.layout = dbc.Container([
                     updatemode='drag'
                 )
             ], style={'margin-bottom': '10px'}),
-            html.Div("Gamma slider ", style={'margin-bottom': '20px', 'font-style': 'italic'}),
+            html.Div("Adjustment slider (used for multiple transformations)", style={'margin-bottom': '20px', 'font-style': 'italic'}),
             html.Div([
                 dcc.Slider(
                     id='quantization-slider',
@@ -131,6 +162,19 @@ app.layout = dbc.Container([
                 )
             ], style={'margin-bottom': '10px'}),
             html.Div("Quantization slider (for Image Quantization only)", style={'margin-bottom': '20px', 'font-style': 'italic'}),
+            html.Div([
+                dcc.Slider(
+                    id='padding-slider',
+                    min=0,
+                    max=100,
+                    step=1,
+                    value=10,
+                    marks={0: '0', 50: '50', 100: '100'},
+                    tooltip={"placement": "bottom", "always_visible": True},
+                    updatemode='drag'
+                )
+            ], style={'margin-bottom': '10px'}),
+            html.Div("Padding slider (for Image Padding only)", style={'margin-bottom': '20px', 'font-style': 'italic'}),
         ], width=4),
         dbc.Col([
             html.Div(id='output-original-image', style={'margin-bottom': '20px'}),
@@ -141,57 +185,85 @@ app.layout = dbc.Container([
     ])
 ], fluid=True)
 
+# Add this function
+def histogram_matching(image, reference):
+    # Check if images are grayscale or color
+    if len(image.shape) == 2:
+        # Grayscale images
+        matched = exposure.match_histograms(image, reference)
+    else:
+        # Color images
+        matched = np.zeros_like(image)
+        for i in range(3):  # process each channel
+            matched[:,:,i] = exposure.match_histograms(image[:,:,i], reference[:,:,i])
+    
+    return matched.astype(np.uint8)
+
 # Callbacks for transformations and enabling/disabling reference upload
 @app.callback(
     Output('output-original-image', 'children'),
     Output('output-transformed-image', 'children'),
     Output('output-original-histogram', 'children'),
     Output('output-transformed-histogram', 'children'),
-    Output('gamma-slider', 'included'),
-    Output('quantization-slider', 'included'),
+    Output('gamma-slider', 'disabled'),
+    Output('quantization-slider', 'disabled'),
+    Output('padding-slider', 'disabled'),
     Output('upload-reference', 'disabled'),
     Input('upload-image', 'contents'),
     Input('upload-reference', 'contents'),
     Input('transformation-type', 'value'),
     Input('gamma-slider', 'value'),
-    Input('quantization-slider', 'value')
+    Input('quantization-slider', 'value'),
+    Input('padding-slider', 'value')
 )
-def update_output(contents, reference_contents, transformation_type, gamma_value, quantization_value):
+def update_output(contents, reference_contents, transformation_type, gamma_value, quantization_value, padding_value):
     if contents is None:
-        return "Upload an image to start!", None, None, None, False, False, True
+        return "Upload an image to start!", None, None, None, True, True, True, True
 
     # Parse the uploaded image
     image = parse_image(contents)
     if image is None:
-        return "Invalid image file!", None, None, None, False, False, True
+        return "Invalid image file!", None, None, None, True, True, True, True
 
     # Initialize variables
     transformed_image = None
-    show_gamma_slider = False
-    show_quantization_slider = False
+    disable_gamma_slider = True
+    disable_quantization_slider = True
+    disable_padding_slider = True
     reference_required = transformation_type == 'hist_match'
 
     # Check if transformation requires a reference image
     if reference_required:
         if reference_contents is None:
-            return "Upload a reference image to proceed with histogram matching!", None, None, None, False, False, False
+            return "Upload a reference image to proceed with histogram matching!", None, None, None, True, True, True, False
         reference_image = parse_image(reference_contents)
         if reference_image is None:
-            return "Invalid reference image file!", None, None, None, False, False, False
+            return "Invalid reference image file!", None, None, None, True, True, True, False
         transformed_image = histogram_matching(image, reference_image)
     else:
         if transformation_type == 'log':
-            transformed_image = log_transformation(image)
+            transformed_image = log_transformation(image, gamma_value)
+            disable_gamma_slider = False
         elif transformation_type == 'gamma':
             transformed_image = gamma_transformation(image, gamma_value)
-            show_gamma_slider = True
+            disable_gamma_slider = False
         elif transformation_type == 'contrast':
-            transformed_image = contrast_stretching(image)
+            # Use gamma_value to determine percentile range
+            percentile_range = (gamma_value, 100 - gamma_value)
+            transformed_image = contrast_stretching(image, percentile_range)
+            disable_gamma_slider = False
         elif transformation_type == 'hist_eq':
-            transformed_image = histogram_equalization(image)
+            # Use gamma_value as clip_limit for adaptive histogram equalization
+            clip_limit = gamma_value / 10  # Scale down the value to a reasonable range
+            transformed_image = histogram_equalization(image, clip_limit)
+            disable_gamma_slider = False
         elif transformation_type == 'quantization':
             transformed_image = image_quantization(image, quantization_value)
-            show_quantization_slider = True
+            disable_quantization_slider = False
+        elif transformation_type == 'padding':
+            # You can change the color here. For example, let's use blue padding
+            transformed_image = image_padding(image, padding_value, pad_color=[0, 0, 255])
+            disable_padding_slider = False
 
     # Plotly figure for original image
     fig_original = go.Figure(go.Image(z=image))
@@ -227,10 +299,18 @@ def update_output(contents, reference_contents, transformation_type, gamma_value
     fig_transformed_hist.update_layout(title="Transformed Histogram", barmode='overlay',
                                        margin=dict(l=0, r=0, t=30, b=0))
 
-    # Enable or disable the reference image upload based on transformation type
-    return (dcc.Graph(figure=fig_original), dcc.Graph(figure=fig_transformed),
-            dcc.Graph(figure=fig_original_hist), dcc.Graph(figure=fig_transformed_hist), show_gamma_slider,
-            show_quantization_slider, not reference_required)
+    # Update the return statement
+    return (
+        dcc.Graph(figure=fig_original),
+        dcc.Graph(figure=fig_transformed),
+        dcc.Graph(figure=fig_original_hist),
+        dcc.Graph(figure=fig_transformed_hist),
+        disable_gamma_slider,
+        disable_quantization_slider,
+        disable_padding_slider,
+        reference_required
+    )
 
 if __name__ == '__main__':
     app.run_server(debug=True)
+# Comment
