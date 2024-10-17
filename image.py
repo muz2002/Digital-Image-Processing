@@ -8,6 +8,9 @@ import numpy as np
 from skimage import exposure
 import plotly.graph_objects as go
 from sklearn.cluster import KMeans
+from skimage.util import random_noise
+from scipy.signal import convolve2d
+from dash import callback_context
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 
@@ -106,6 +109,34 @@ def image_padding(image, pad_width, pad_color=[255, 0, 0]):  # Default to red pa
         value=pad_color_bgr
     )
 
+# Add this new function for adding noise to an image
+def add_noise(image, noise_type='gaussian', variance=0.01):
+    if noise_type == 'gaussian':
+        noisy_image = random_noise(image, mode=noise_type, var=variance)
+    else:
+        # For other noise types, you might need to adjust parameters accordingly
+        noisy_image = random_noise(image, mode=noise_type)
+    
+    return np.clip(noisy_image * 255, 0, 255).astype(np.uint8)
+
+# Add this new function for convolution
+def apply_convolution(image, kernel):
+    if len(image.shape) == 2:  # Grayscale image
+        return cv2.filter2D(image, -1, kernel)
+    else:  # Color image
+        result = np.zeros_like(image)
+        for i in range(3):
+            result[:,:,i] = cv2.filter2D(image[:,:,i], -1, kernel)
+        return result
+
+# Define some common kernels
+kernels = {
+    'blur': np.ones((5,5)) / 25,
+    'sharpen': np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]]),
+    'edge_detect': np.array([[-1,-1,-1], [-1,8,-1], [-1,-1,-1]]),
+    'emboss': np.array([[-2,-1,0], [-1,1,1], [0,1,2]])
+}
+
 # Layout of the app
 app.layout = dbc.Container([
     dbc.Row([
@@ -130,11 +161,24 @@ app.layout = dbc.Container([
                              {'label': 'Histogram Equalization', 'value': 'hist_eq'},
                              {'label': 'Histogram Matching', 'value': 'hist_match'},
                              {'label': 'Image Quantization', 'value': 'quantization'},
-                             {'label': 'Image Padding', 'value': 'padding'}
+                             {'label': 'Image Padding', 'value': 'padding'},
+                             {'label': 'Add Noise', 'value': 'noise'},
+                             {'label': 'Convolution', 'value': 'convolution'}  # New option
                          ],
                          value='log',
                          clearable=False,
                          style={'margin-bottom': '20px'}
+                         ),
+            dcc.Dropdown(id='convolution-kernel',
+                         options=[
+                             {'label': 'Blur', 'value': 'blur'},
+                             {'label': 'Sharpen', 'value': 'sharpen'},
+                             {'label': 'Edge Detect', 'value': 'edge_detect'},
+                             {'label': 'Emboss', 'value': 'emboss'}
+                         ],
+                         value='blur',
+                         clearable=False,
+                         style={'margin-bottom': '20px', 'display': 'none'}
                          ),
             html.Div([
                 dcc.Slider(
@@ -209,21 +253,33 @@ def histogram_matching(image, reference):
     Output('quantization-slider', 'disabled'),
     Output('padding-slider', 'disabled'),
     Output('upload-reference', 'disabled'),
+    Output('convolution-kernel', 'style'),
     Input('upload-image', 'contents'),
     Input('upload-reference', 'contents'),
     Input('transformation-type', 'value'),
     Input('gamma-slider', 'value'),
     Input('quantization-slider', 'value'),
-    Input('padding-slider', 'value')
+    Input('padding-slider', 'value'),
+    Input('convolution-kernel', 'value')
 )
-def update_output(contents, reference_contents, transformation_type, gamma_value, quantization_value, padding_value):
+def update_output(contents, reference_contents, transformation_type, gamma_value, quantization_value, padding_value, convolution_kernel):
+    ctx = callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    convolution_dropdown_style = {'margin-bottom': '20px', 'display': 'none'}
+
+    if trigger_id == 'transformation-type':
+        if transformation_type == 'convolution':
+            convolution_dropdown_style = {'margin-bottom': '20px', 'display': 'block'}
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, convolution_dropdown_style
+
     if contents is None:
-        return "Upload an image to start!", None, None, None, True, True, True, True
+        return "Upload an image to start!", None, None, None, True, True, True, True, convolution_dropdown_style
 
     # Parse the uploaded image
     image = parse_image(contents)
     if image is None:
-        return "Invalid image file!", None, None, None, True, True, True, True
+        return "Invalid image file!", None, None, None, True, True, True, True, convolution_dropdown_style
 
     # Initialize variables
     transformed_image = None
@@ -232,13 +288,12 @@ def update_output(contents, reference_contents, transformation_type, gamma_value
     disable_padding_slider = True
     reference_required = transformation_type == 'hist_match'
 
-    # Check if transformation requires a reference image
     if reference_required:
         if reference_contents is None:
-            return "Upload a reference image to proceed with histogram matching!", None, None, None, True, True, True, False
+            return "Upload a reference image to proceed with histogram matching!", None, None, None, True, True, True, False, {'margin-bottom': '20px', 'display': 'none'}
         reference_image = parse_image(reference_contents)
         if reference_image is None:
-            return "Invalid reference image file!", None, None, None, True, True, True, False
+            return "Invalid reference image file!", None, None, None, True, True, True, False, {'margin-bottom': '20px', 'display': 'none'}
         transformed_image = histogram_matching(image, reference_image)
     else:
         if transformation_type == 'log':
@@ -248,22 +303,27 @@ def update_output(contents, reference_contents, transformation_type, gamma_value
             transformed_image = gamma_transformation(image, gamma_value)
             disable_gamma_slider = False
         elif transformation_type == 'contrast':
-            # Use gamma_value to determine percentile range
             percentile_range = (gamma_value, 100 - gamma_value)
             transformed_image = contrast_stretching(image, percentile_range)
             disable_gamma_slider = False
         elif transformation_type == 'hist_eq':
-            # Use gamma_value as clip_limit for adaptive histogram equalization
-            clip_limit = gamma_value / 10  # Scale down the value to a reasonable range
+            clip_limit = gamma_value / 10
             transformed_image = histogram_equalization(image, clip_limit)
             disable_gamma_slider = False
         elif transformation_type == 'quantization':
             transformed_image = image_quantization(image, quantization_value)
             disable_quantization_slider = False
         elif transformation_type == 'padding':
-            # You can change the color here. For example, let's use blue padding
             transformed_image = image_padding(image, padding_value, pad_color=[0, 0, 255])
             disable_padding_slider = False
+        elif transformation_type == 'noise':
+            variance = (gamma_value - 0.1) / 49
+            transformed_image = add_noise(image, variance=variance)
+            disable_gamma_slider = False
+        elif transformation_type == 'convolution':
+            kernel = kernels[convolution_kernel]
+            transformed_image = apply_convolution(image, kernel)
+            convolution_dropdown_style = {'margin-bottom': '20px', 'display': 'block'}
 
     # Plotly figure for original image
     fig_original = go.Figure(go.Image(z=image))
@@ -308,7 +368,8 @@ def update_output(contents, reference_contents, transformation_type, gamma_value
         disable_gamma_slider,
         disable_quantization_slider,
         disable_padding_slider,
-        reference_required
+        reference_required,
+        convolution_dropdown_style
     )
 
 if __name__ == '__main__':
