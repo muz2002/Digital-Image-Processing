@@ -1,0 +1,6 @@
+dash==2.18.1
+opencv-python-headless  # Or use opencv-python if GUI support is needed
+scikit-image
+plotly
+numpy
+dash_bootstrap_components
