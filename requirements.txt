@@ -1,5 +1,5 @@
 dash==2.18.1
-opencv-python-headless  # Or use opencv-python if GUI support is needed
+opencv-python-headless  
 scikit-image
 plotly
 numpy
